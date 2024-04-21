@@ -8,7 +8,10 @@ class PTPBase
 {
 public:
     PTPBase(bool master_, bool slave_, bool p2p_);
-    void begin();
+    void begin(double frameDuration, int64_t jumpThreshold,
+               double rateLimitPerUpdate, double clockUpdateRate,
+               void (*interruptBlockerFkt)(), void (*updateInterruptFkt)(),
+               bool skipAtStart=false);
     void update();
     void reset();
     void setKi(double val);
@@ -24,12 +27,12 @@ protected:
     virtual void initSockets()=0;
     virtual void updateSockets()=0;
     virtual void sendPTPMessage(const uint8_t *buf, int size, bool generalMessage)=0;
-    
+
     void parsePTPMessage(const uint8_t *buf, int size, const timespec &recv_ts);
     bool master;
     bool slave;
     bool p2p;
-    
+
 private:
 	void setT1(NanoTime ts);
 	void setT2(NanoTime ts);
@@ -40,12 +43,13 @@ private:
     void parseDelayResponseMessage(const uint8_t *buf, const timespec &recv_ts);
     void parseDelayResponseFollowUpMessage(const uint8_t *buf);
     void parseDelayRequestMessage(const uint8_t *buf, const timespec &recv_ts);
-    
+
     void delayRequestMessage();
     void followUpMessage(const timespec &send_ts);
     void delayResponseMessage(const uint8_t *request_buf, uint16_t sequenceID, const timespec &request_recv_ts);
     void initPTPMessage(uint8_t *buf, const uint16_t messageLength, const uint8_t messageType, const uint16_t sequenceID, const uint8_t controlField);
     void updateController();
+    void updateClock();
     void updateTimer();
     void updatePPS();
 
@@ -82,9 +86,23 @@ private:
     NanoTime currentOffset=0;
     NanoTime currentDelay=0;
     int nspsAccu=0;
-    double driftNSPS=0;
-    double KI=0.5;
-    double KP=1.0;
+    double currentNSPS=0;
+    double avgNSPSsinceUpdate=0;
+    bool avgNSPSvalid=true;
+    double driftEstimationLP=0;
+    double targetNSPS=0;
+    double rateLimitPerUpdate=0;
+    double clockUpdateRate=1;
+    double KI=0.2;
+    double KP=0.5;
     int updateCounter=0;
-    
+    int clockUpdatesRemaining=0;
+    bool skipAtStart=false;
+    elapsedMillis sincePTPUpdate;
+
+    // tri-sync variables
+    int64_t triJumpThreshold=0;
+    double triFrameDuration=0;
+    void (*triInterruptBlocker)()=NULL;
+    void (*triUpdateInterrupt)()=NULL;
 };

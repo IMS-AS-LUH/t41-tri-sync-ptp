@@ -1,9 +1,16 @@
 #include <QNEthernet.h>
 #include <TimeLib.h>
+#include <inttypes.h>
+
 #include "ptp-base.h"
 
-const int logging = 0;
+const int logging = 1;
 const int hwOffset = -200; // Hardware Offset
+
+constexpr double DRIFT_OUTLIER_THRESHOLD = 30000;
+constexpr int STABLE_THRESHOLD = 100;
+constexpr double MAX_CLOCK_DRIFT = 5000000;
+
 
 void printTime(const NanoTime t)
 {
@@ -76,7 +83,10 @@ p2p(p2p_)
 
 }
 
-void PTPBase::begin()
+void PTPBase::begin(double frameDuration, int64_t jumpThreshold,
+                    double rateLimitPerUpdate, double clockUpdateRate,
+                    void (*interruptBlockerFkt)(), void (*updateInterruptFkt)(),
+                    bool skipAtStart)
 {
     reset();
     if (initialised)
@@ -84,6 +94,14 @@ void PTPBase::begin()
         return;
     }
     initSockets();
+
+    triFrameDuration = frameDuration;
+    triJumpThreshold = jumpThreshold;
+    triInterruptBlocker = interruptBlockerFkt;
+    triUpdateInterrupt = updateInterruptFkt;
+    this->rateLimitPerUpdate = rateLimitPerUpdate;
+    this->clockUpdateRate = clockUpdateRate;
+    this->skipAtStart = skipAtStart;
 
     initialised = true;
 
@@ -118,12 +136,16 @@ void PTPBase::update()
             t6updated = false;
             if (t1lastvalid && t2lastvalid)
             {
+                updateTimer();
                 t1lastvalid = false;
                 t2lastvalid = false;
-                updateTimer();
             }
         }
-        
+        else if (clockUpdatesRemaining > 0 && sincePTPUpdate >= 1000/clockUpdateRate)
+        {
+            updateClock();
+        }
+
         if (ppsupdated && t1lastvalid && t2lastvalid)
 		{
 			ppsupdated = false;
@@ -168,7 +190,8 @@ void PTPBase::reset()
     t2lastvalid = false;
 
     nspsAccu = 0;
-    driftNSPS = 0;
+    currentNSPS = 0;
+    driftEstimationLP = 0;
 }
 
 void PTPBase::setKi(double val)
@@ -185,76 +208,205 @@ void PTPBase::setKp(double val)
 
 void PTPBase::updateController()
 {
-    const double t1diff = (t1 - t1last);
-    const double t2diff = (t2 - t2last);
-    const double currentDrift = t2diff / t1diff;
-    
-    const bool coarseMode = currentOffset > 1000 || currentOffset < -1000;
-
-    const double currentDriftNsps = (1.0 - currentDrift) * NS_PER_S;
-
-    const NanoTime offsetCorrection = -currentOffset;
-    t2 += offsetCorrection;
-
-    double nspsAdjust = 0;
-    double nspsAdjustC = 0;
-    double nspsAdjustP = 0;
-    double nspsAdjustI = 0;
-
-    if (coarseMode)
+    // update master drift estimation
+    if (t1lastvalid && t2lastvalid)
     {
-        driftNSPS += currentDriftNsps;
-        nspsAdjustC = driftNSPS;
-        nspsAdjust = nspsAdjustC;
-        qindesign::network::EthernetIEEE1588.adjustFreq(nspsAdjust);
-        qindesign::network::EthernetIEEE1588.offsetTimer(offsetCorrection);
+        avgNSPSsinceUpdate += currentNSPS / 1000 * sincePTPUpdate;
+        // validity (max possible change!)
+        if (avgNSPSsinceUpdate - currentNSPS > rateLimitPerUpdate * (clockUpdateRate - 1) / 2){
+            avgNSPSvalid = false;
+        }
+        if (avgNSPSsinceUpdate - currentNSPS < -rateLimitPerUpdate * (clockUpdateRate - 1) / 2){
+            avgNSPSvalid = false;
+        }
+        if (sincePTPUpdate > 1100){
+            avgNSPSvalid = false;
+        }
 
-        nspsAccu = 0;
+        double baseNSPS = avgNSPSvalid ? avgNSPSsinceUpdate : currentNSPS;
+        avgNSPSsinceUpdate = 0;
+        avgNSPSvalid = true;
+        const double t1diff = (t1 - t1last);
+        const double t2diff = (t2 - t2last);
+        const double driftEstimation = (1.0 - t2diff / t1diff) * NS_PER_S + baseNSPS;
+        if (abs(driftEstimation - driftEstimationLP) > DRIFT_OUTLIER_THRESHOLD){
+            if(logging){
+                Serial.printf("Drift estimation of %f detected as outlier!\n", driftEstimation);
+            }
+            return;
+        }
+        if (driftEstimationLP == 0)
+        {
+            driftEstimationLP = driftEstimation;
+        }
+        else
+        {
+            driftEstimationLP = (driftEstimationLP * 7 + driftEstimation) / 8;
+        }
+        if (logging)
+        {
+            Serial.printf("Drift estimation: %f\n", driftEstimationLP);
+        }
+    }
+    const NanoTime offsetCorrection = -currentOffset;
+
+    if (skipAtStart && updateCounter < 5 && abs(offsetCorrection) > 1000
+        & t1lastvalid && t2lastvalid){
+        currentNSPS = driftEstimationLP;
+        triInterruptBlocker();
+        qindesign::network::EthernetIEEE1588.offsetTimer(offsetCorrection);
+        qindesign::network::EthernetIEEE1588.adjustFreq(currentNSPS);
+        triUpdateInterrupt();
+        t2 += offsetCorrection;
+        // set accumulator
+        nspsAccu = currentNSPS / KI;
+
+        if (logging)
+        {
+            Serial.printf("Quick sync at start: Set NSPS to %f and corrected by %" PRId64 "\n", currentNSPS, offsetCorrection);
+        }
+    }
+    else if (currentOffset > triJumpThreshold || currentOffset < -triJumpThreshold)
+    {
+        // check if offset is big enough for coarse mode
+        // coarse mode
+        const NanoTime seconds = offsetCorrection / NS_PER_S;
+        NanoTime offsetCorrectionQuantized = seconds * NS_PER_S;
+        const NanoTime remaining = offsetCorrection - offsetCorrectionQuantized;
+        offsetCorrectionQuantized += roundf(remaining/triFrameDuration) * triFrameDuration;
+        triInterruptBlocker();
+        qindesign::network::EthernetIEEE1588.offsetTimer(offsetCorrectionQuantized);
+        triUpdateInterrupt();
+        t2 += offsetCorrectionQuantized;
+        if (logging)
+        {
+            Serial.printf("Coarse mode correction: %" PRId64 "\n", offsetCorrectionQuantized);
+        }
     }
     else
     {
+        // fine mode
+        // update PI-controller
         nspsAccu += offsetCorrection;
-        nspsAdjustC = driftNSPS;
-        nspsAdjustP = (static_cast<double>(offsetCorrection) * KP);
-        nspsAdjustI = (static_cast<double>(nspsAccu) * KI);
-        nspsAdjust = nspsAdjustC + nspsAdjustP + nspsAdjustI;
-        qindesign::network::EthernetIEEE1588.adjustFreq(nspsAdjust);
+        double nspsAdjustP = static_cast<double>(offsetCorrection) * KP;
+        double nspsAdjustI = static_cast<double>(nspsAccu) * KI;
+        targetNSPS = nspsAdjustP + nspsAdjustI;
+
+        double diffNSPS = currentNSPS - driftEstimationLP;
+        // check if linear prediction mode activates
+        if (t1lastvalid && t2lastvalid && abs(diffNSPS) > rateLimitPerUpdate * clockUpdateRate && abs(offsetCorrection) > 5000)
+        {
+            double numUpdates = abs(diffNSPS) / rateLimitPerUpdate * 1.05;
+            double numUpdatesMargin = numUpdates + clockUpdateRate;
+
+            double possibleOffsetChange = (
+                rateLimitPerUpdate / (2 * clockUpdateRate)
+                * numUpdates * (numUpdates + 1)
+                );
+            double possibleOffsetChangeMargin = (
+                rateLimitPerUpdate / (2 * clockUpdateRate)
+                * numUpdatesMargin * (numUpdatesMargin + 1)
+                );
+
+            Serial.printf("LPM| PO:%f, POM:%f, O:%" PRId64 ", Diff:%f\n", possibleOffsetChange, possibleOffsetChangeMargin, offsetCorrection, diffNSPS);
+
+            if (possibleOffsetChangeMargin > abs(offsetCorrection) && ((diffNSPS < 0) == (offsetCorrection<0)))
+            {
+                // enter linear prediction mode and overwrite PI-controller outputs
+                int direction = diffNSPS < 0 ? 1 : -1;
+
+                if (possibleOffsetChange > abs(offsetCorrection))
+                {
+                    targetNSPS = currentNSPS + direction * rateLimitPerUpdate * clockUpdateRate;
+                }
+                else
+                {
+                    // stall
+                    targetNSPS = currentNSPS;
+                }
+
+                // reset accumulator
+                nspsAccu = (targetNSPS - offsetCorrection * KP) / KI;
+                if (logging)
+                {
+                    Serial.printf("LPM mode active: DiffNSPS: %f\n", diffNSPS);
+                }
+            }
+
+        }
+        clockUpdatesRemaining = clockUpdateRate;
+        updateClock();
+
+        if(logging)
+        {
+            Serial.printf("Fine| CurrentNSPS:%f TargetNSPS:%f P(%f):%f I(%f):%f\n",
+                currentNSPS, targetNSPS,
+                KP, nspsAdjustP, KI, nspsAdjustI);
+        }
     }
-    
-    if(currentOffset < 100 && currentOffset > -100){
+    if (logging)
+    {
+        Serial.printf("Delay:%" PRId64 "ns ", currentDelay);
+        Serial.printf("Offset:%" PRId64 "ns\n", currentOffset);
+    }
+
+    if(currentOffset < STABLE_THRESHOLD && currentOffset > -STABLE_THRESHOLD){
     	lockcount++;
     }else{
     	lockcount=0;
     }
 
-    if (logging)
+    updateCounter++;
+}
+
+void PTPBase::updateClock()
+{
+    if (clockUpdatesRemaining != clockUpdateRate){
+        if (sincePTPUpdate > 1100){
+            avgNSPSvalid = false;
+        }
+        avgNSPSsinceUpdate += currentNSPS / 1000 * sincePTPUpdate;
+    }
+    clockUpdatesRemaining -= 1;
+    double diffNSPS = targetNSPS - currentNSPS;
+    // check if rate limiting applies
+    if (rateLimitPerUpdate == 0)
     {
+        currentNSPS = targetNSPS;
+        clockUpdatesRemaining = 0;
+    }
+    else if (diffNSPS > rateLimitPerUpdate)
+    {
+        currentNSPS += rateLimitPerUpdate;
 
-        Serial.printf("T2diff:%f T1diff:%f\n", t2diff, t1diff);
-        Serial.printf("T2-T1:%d T4-T3:%d\n", (int)(t2 - t1), (int)(t4 - t3));
-        Serial.printf("Delay:%dns ", (int)currentDelay);
-        Serial.printf("Offset:%dns ", (int)currentOffset);
-        Serial.printf("Drift:%dns \n", (int)currentDriftNsps);
-        if (coarseMode)
-        {
-            Serial.printf("Coarse Filter NSPS:%f", nspsAdjust);
-        }
-        else
-        {
-            Serial.printf("Fine   Filter NSPS:%f C:%f P(%f):%f I(%f):%f", nspsAdjust, nspsAdjustC, KP, nspsAdjustP, KI, nspsAdjustI);
-        }
-
-        Serial.println();
-        Serial.printf("ENET_ATINC %08X\n", ENET_ATINC);
-        Serial.printf("ENET_ATPER %d\n", ENET_ATPER);
-        Serial.printf("ENET_ATCOR %d (%f)\n", ENET_ATCOR, 25000000 / nspsAdjust);
+    }
+    else if (diffNSPS < -rateLimitPerUpdate)
+    {
+        currentNSPS -= rateLimitPerUpdate;
     }
     else
     {
-        //Serial.printf("%d %d %d %d %d %f %f %f %f\n",updateCounter,coarseMode ? 0 : 1,(int)currentDelay, (int)currentOffset, (int)currentDriftNsps, nspsAdjustC, nspsAdjustP, nspsAdjustI, tempmonGetTemp());
+        currentNSPS = targetNSPS;
+        clockUpdatesRemaining = 0;
     }
-    updateCounter++;
+
+    // cap NSPS
+    if (currentNSPS > MAX_CLOCK_DRIFT){
+        currentNSPS = MAX_CLOCK_DRIFT;
+    }
+    else if (currentNSPS < -MAX_CLOCK_DRIFT){
+        currentNSPS = -MAX_CLOCK_DRIFT;
+    }
+
+    triInterruptBlocker();
+    qindesign::network::EthernetIEEE1588.adjustFreq(currentNSPS);
+    sincePTPUpdate = 0;
+    if (logging > 2)
+    {
+        Serial.printf("NewNSPS: %f\n", currentNSPS);
+    }
 }
+
 
 int PTPBase::getLockCount()
 {
@@ -274,7 +426,7 @@ void PTPBase::updateTimer()
         currentDelay = ((t4 - t1) - (t3 - t2)) / 2;
         currentOffset = (t2 - t1) - currentDelay + hwOffset;
     }
-    
+
     updateController();
 }
 
@@ -325,8 +477,8 @@ void PTPBase::setT2(NanoTime ts){
     t2lastvalid = t2last > 0;
     t2 = ts;
     t2updated = true;
-    
-    if (logging)
+
+    if (logging > 1)
     {
         Serial.print("T2 Sync  receive timestamp=");
         printTime(t2);
@@ -339,7 +491,7 @@ void PTPBase::parseSyncMessage(const uint8_t *buf, const timespec &recv_ts)
     const uint16_t sequenceID = (buf[30] << 8) | buf[31];
 
     if (twoStepFlag > 0) // Sync twoStep
-    {	
+    {
     	setT2(timespecToNanoTime(recv_ts));
     	syncSequenceID = sequenceID;
 
@@ -351,8 +503,8 @@ void PTPBase::setT1(NanoTime ts){
     t1lastvalid = t1last > 0;
     t1 = ts;
     t1updated = true;
-    
-    if (logging)
+
+    if (logging > 1)
     {
         Serial.print("T1 Sync  send    timestamp=");
         printTime(t1);
@@ -369,7 +521,7 @@ void PTPBase::parseFollowUpMessage(const uint8_t *buf)
 void PTPBase::setT4(NanoTime ts){
 	t4 = ts;
     t4updated = true;
-    if (logging)
+    if (logging > 1)
     {
         Serial.print("T4 Delay receive timestamp=");
         printTime(t4);
@@ -385,7 +537,7 @@ void PTPBase::parseDelayResponseMessage(const uint8_t *buf, const timespec &recv
         setT4(bufferToNanoTime(buf));
         t6 = timespecToNanoTime(recv_ts);
         t6updated = true;
-        if (logging)
+        if (logging > 1)
         {
             if(p2p){
                 Serial.print("T6 Resp  receive timestamp=");
@@ -405,13 +557,13 @@ void PTPBase::parseDelayResponseFollowUpMessage(const uint8_t *buf)
     {
         t5 = bufferToNanoTime(buf);
         t5updated = true;
-        if (logging)
+        if (logging > 1)
         {
             Serial.print("T5 Resp  send    timestamp=");
             printTime(t5);
             Serial.println("");
         }
-    }    
+    }
 }
 
 void PTPBase::parseDelayRequestMessage(const uint8_t *buf, const timespec &recv_ts)
@@ -420,7 +572,7 @@ void PTPBase::parseDelayRequestMessage(const uint8_t *buf, const timespec &recv_
     t4s = timespecToNanoTime(recv_ts)+ hwOffset;
     timespec ts;
     nanoTimeToTimespec(t4s,ts);
-    if (logging)
+    if (logging > 1)
     {
         Serial.print("T4s Delay receiv timestamp=");
         printTime(t4s);
@@ -436,7 +588,7 @@ void PTPBase::delayResponseMessage(const uint8_t *request_buf, uint16_t sequence
     uint16_t size=54;
     uint8_t type=9;
     uint8_t control=3;
-   
+
     uint8_t buf[size] = {0};
 
     initPTPMessage(buf, size, type, sequenceID, control);
@@ -463,7 +615,7 @@ void PTPBase::announceMessage()
     uint16_t size=64;
     uint8_t type=11;
     uint8_t control=5;
-   
+
     uint8_t buf[size] = {0};
 
     initPTPMessage(buf, size, type, announceServerSequenceID++, control);
@@ -496,7 +648,7 @@ void PTPBase::syncMessage()
     uint16_t size=44;
     uint8_t type=0;
     uint8_t control=0;
-   
+
     uint8_t buf[size] = {0};
 
     initPTPMessage(buf, size, type, syncServerSequenceID, control);
@@ -504,7 +656,7 @@ void PTPBase::syncMessage()
     buf[33]=0;
     qindesign::network::EthernetIEEE1588.timestampNextFrame();
     sendPTPMessage(buf,size,false);
-    
+
 
     struct timespec send_ts;
     if (logging >= 2)
@@ -524,7 +676,7 @@ void PTPBase::syncMessage()
     }
     t1s = timespecToNanoTime(send_ts)+ hwOffset;
     nanoTimeToTimespec(t1s,send_ts);
-    if (logging)
+    if (logging > 1)
     {
         Serial.print("T1s Delay send   timestamp=");
         printTime(t1s);
@@ -541,7 +693,7 @@ void PTPBase::followUpMessage(const timespec &send_ts)
     uint16_t size=44;
     uint8_t type=8;
     uint8_t control=2;
-   
+
     uint8_t buf[size] = {0};
 
     initPTPMessage(buf, size, type, syncServerSequenceID, control);
@@ -553,7 +705,7 @@ void PTPBase::followUpMessage(const timespec &send_ts)
 void PTPBase::setT3(NanoTime ts){
 	t3 = ts;
     t3updated = true;
-    if (logging)
+    if (logging > 1)
     {
         Serial.print("T3 Delay send    timestamp=");
         printTime(t3);
@@ -606,7 +758,7 @@ void PTPBase::ppsInterruptTriggered(NanoTime pps_ts, NanoTime local_ts){
 	}
 	setT2(local_ts);
 	setT1(pps_ts);
-	
+
 	ppsupdated=true;
 }
 
