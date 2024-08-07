@@ -54,7 +54,7 @@ constexpr double PULSE_PERIOD_NS = NS_PER_S / static_cast<double>(LINES_PER_FRAM
 
 constexpr int NS_TO_SYNC = SAMPLES_PER_EDGE * MS_PER_S * MS_PER_S / SAMPLES_PER_MS +
                            VSYNC_END_RESET * MS_PER_S * MS_PER_S / SAMPLES_PER_MS;
-const int PREOFFSET = NS_TO_SYNC + 200 + 64; // 200 for initial setup | 100 based on osci // TODO:
+const int PREOFFSET = NS_TO_SYNC + 200 + 64; // 200 for initial setup | 100 based on osci
                                              // 64 vs 100 jumps more than 36?!Interrupt collision?
 const int MANUAL_OFFSET = TRISYNC_OFFSETNS - NS_TO_SYNC - 200;
 
@@ -142,7 +142,7 @@ void pulse()
 {
     // NOTE: critical time section
     // initial wait for a clean following pulse form
-    delayCycles(200 * CYCLES_PER_NS); // TODO:
+    delayCycles(200 * CYCLES_PER_NS);
     // reset vsync broad pulse (if it was set. Otherwise nothing will happen)
     digitalWriteFast(pinbit0, HIGH);
     delayCycles(CYCLES_VSYNC_END_RESET);
