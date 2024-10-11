@@ -1,6 +1,6 @@
 # Tri-Level Sync Generation based on a PTP-synchronized clock with the Teensy 4.1
 
-This [repository](https://github.com/IMS-AS-LUH/t41-tri-sync-ptp) provides the source code for our (yet unpublished) research paper "PTP-Synchronized Tri-Level Sync Generation for Networked Multi-Sensor Systems". This Arduino compatible library has been created to provide a Tri-Level Sync signal generation based on a PTP-Synchronized clock for the Teensy 4.1 microcontroller platform.
+This [repository](https://github.com/IMS-AS-LUH/t41-tri-sync-ptp) provides the source code for our research paper "PTP-Synchronized Tri-Level Sync Generation for Networked Multi-Sensor Systems" ([Published Article](https://doi.org/10.1109/RTCSA62462.2024.00022)). This Arduino compatible library has been created to provide a Tri-Level Sync signal generation based on a PTP-Synchronized clock for the Teensy 4.1 microcontroller platform.
 
 This library was created by the Architectures and Systems Group of the Institute of Microelectronic Systems ([IMS/AS](https://www.ims.uni-hannover.de/de/institut/architekturen-und-systeme/)) at the [Leibniz University](https://www.uni-hannover.de) in Germany.
 
@@ -31,19 +31,18 @@ The lower and higher pin for the example are pin 10 and 12.
 
 ## Citation
 
-If you use our Tri-Level Sync library (or parts of it) in scientific work, please cite our paper (not published yet):
+If you use our Tri-Level Sync library (or parts of it) in scientific work, please cite our paper:
 
 ```
-@unpublished{riggers2024tri,
-title={Sub-Microsecond Time Synchronization for Network-Connected Microcontrollers},
-author={Christoph Riggers and Jens Schleusner and Oliver Renke and Holger Blume},
-booktitle="2024 IEEE 30th International Conference on Embedded and Real-Time Computing Systems and Applications (RTCSA)",
-month=aug,
-year=2024,
-}
+@INPROCEEDINGS{10695636,
+  author={Riggers, Christoph and Schleusner, Jens and Renke, Oliver and Blume, Holger},
+  booktitle={2024 IEEE 30th International Conference on Embedded and Real-Time Computing Systems and Applications (RTCSA)},
+  title={PTP-Synchronized Tri-Level Sync Generation for Networked Multi-Sensor Systems},
+  year={2024},
+  pages={91-96},
+  keywords={Time-frequency analysis;Protocols;SMPTE;Cameras;Signal generators;Software;Real-time systems;Synchronization;Frequency control;Clocks;Precision Time Protocol;PTP;Tri-Level Sync;camera;SMPTE;PI-controller;synchronization;MCU},
+  doi={10.1109/RTCSA62462.2024.00022}}
 ```
-
-The correct precise citation will be updated as soon as possible.
 
 This work is based on the [ptp library](https://github.com/IMS-AS-LUH/t41-ptp). If you are using the
 PTP functionality of this repository, cite them accordingly.
